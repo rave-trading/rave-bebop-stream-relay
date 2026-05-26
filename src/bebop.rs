@@ -6,8 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use tokio::sync::{broadcast, mpsc};
-use tokio_tungstenite::connect_async_with_config;
-use tokio_tungstenite::tungstenite::http::Request;
+use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -130,33 +129,13 @@ async fn run_chain_stream(stream: Arc<ChainStream>) {
     let provider_id = stream.provider_id.clone();
     let url = &stream.url;
 
-    // WebSocket config: 20s ping interval as recommended by Bebop,
-    // large max frame for protobuf pricing snapshots, large max message.
-    let ws_config = {
-        let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-        cfg.max_frame_size = Some(8 << 20); // 8 MB
-        cfg.max_message_size = Some(16 << 20); // 16 MB
-        cfg
-    };
-
     let mut backoff_secs: u64 = 1;
     let max_backoff: u64 = 30;
 
     loop {
         info!("connecting to Bebop pricing stream for {network}...");
 
-        // Build HTTP request with the URL for connect_async_with_config
-        let req = match Request::builder().uri(url).body(()) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Bebop {network} bad URL: {e}; retrying in {backoff_secs}s");
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(max_backoff);
-                continue;
-            }
-        };
-
-        let (mut ws, _resp) = match connect_async_with_config(req, Some(ws_config), false).await {
+        let (mut ws, _resp) = match connect_async(url.as_str()).await {
             Ok(conn) => {
                 info!("connected to Bebop pricing stream for {network}");
                 // Reset backoff on successful connection
