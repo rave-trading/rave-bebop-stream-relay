@@ -34,6 +34,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Capacity: enough for ~1 second of frames across 5 chains at ~10 updates/sec each.
     let (bebop_tx, bebop_rx) = broadcast::channel::<bebop::RelayFrame>(2048);
 
+    // Startup delay to avoid Bebop connection conflicts during Railway rolling deploys.
+    // The old instance may still hold the single-allowed connection; a brief pause
+    // lets it drain before the new instance connects.
+    let startup_delay: u64 = std::env::var("STARTUP_DELAY_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    if startup_delay > 0 {
+        info!("startup delay: waiting {startup_delay}s before connecting to Bebop...");
+        tokio::time::sleep(std::time::Duration::from_secs(startup_delay)).await;
+    }
+
     info!("connecting to Bebop pricing streams (5 chains)...");
     let _bebop = bebop::BebopClient::connect_all(&base_url, &authorization, &provider_id, &stream_name, bebop_tx.clone()).await?;
 

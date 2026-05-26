@@ -5,8 +5,9 @@ use chrono::TimeZone;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 use serde::ser::{Serialize, SerializeStruct, Serializer};
-use tokio::sync::{broadcast, mpsc, Mutex};
-use tokio_tungstenite::connect_async;
+use tokio::sync::{broadcast, mpsc};
+use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -129,24 +130,55 @@ async fn run_chain_stream(stream: Arc<ChainStream>) {
     let provider_id = stream.provider_id.clone();
     let url = &stream.url;
 
+    // WebSocket config: 20s ping interval as recommended by Bebop,
+    // large max frame for protobuf pricing snapshots, large max message.
+    let ws_config = {
+        let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        cfg.max_frame_size = Some(8 << 20); // 8 MB
+        cfg.max_message_size = Some(16 << 20); // 16 MB
+        cfg
+    };
+
+    let mut backoff_secs: u64 = 1;
+    let max_backoff: u64 = 30;
+
     loop {
         info!("connecting to Bebop pricing stream for {network}...");
-        let (mut ws, _resp) = match connect_async(url.as_str()).await {
+
+        // Build HTTP request with the URL for connect_async_with_config
+        let req = match Request::builder().uri(url).body(()) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Bebop {network} bad URL: {e}; retrying in {backoff_secs}s");
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(max_backoff);
+                continue;
+            }
+        };
+
+        let (mut ws, _resp) = match connect_async_with_config(req, Some(ws_config), false).await {
             Ok(conn) => {
                 info!("connected to Bebop pricing stream for {network}");
+                // Reset backoff on successful connection
+                backoff_secs = 1;
                 conn
             }
             Err(e) => {
-                error!("Bebop {network} connect failed: {e}; retrying in 5s");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                error!("Bebop {network} connect failed: {e}; retrying in {backoff_secs}s");
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(max_backoff);
                 continue;
             }
         };
 
         let mut last_batch = Instant::now();
         let batch_interval = Duration::from_millis(100);
-        // Accumulate frames per batch interval to reduce internal WS message count.
         let mut batch: Vec<RelayFrame> = Vec::with_capacity(64);
+        // Track throughput for periodic logging
+        let mut frame_count: u64 = 0;
+        let mut pair_count: u64 = 0;
+        let mut last_report = Instant::now();
+        let report_interval = Duration::from_secs(60);
 
         loop {
             let msg = match ws.next().await {
@@ -157,7 +189,7 @@ async fn run_chain_stream(stream: Arc<ChainStream>) {
                 }
                 Some(Ok(Message::Pong(_))) => continue,
                 Some(Ok(Message::Close(_))) | None => {
-                    warn!("Bebop {network} WS closed; reconnecting...");
+                    warn!("Bebop {network} WS closed; reconnecting in {backoff_secs}s...");
                     break;
                 }
                 Some(Ok(other)) => {
@@ -165,7 +197,7 @@ async fn run_chain_stream(stream: Arc<ChainStream>) {
                     continue;
                 }
                 Some(Err(e)) => {
-                    error!("Bebop {network} WS error: {e}; reconnecting...");
+                    error!("Bebop {network} WS error: {e}; reconnecting in {backoff_secs}s...");
                     break;
                 }
             };
@@ -174,10 +206,27 @@ async fn run_chain_stream(stream: Arc<ChainStream>) {
             match proto::PricingUpdate::decode(msg.as_ref()) {
                 Ok(update) => {
                     let now = Instant::now();
+                    let pair_len = update.pairs.len() as u64;
                     for pair in update.pairs {
                         let frame = decode_pair(chain_id, network, &provider_id, &pair);
                         batch.push(frame);
                     }
+                    frame_count += 1;
+                    pair_count += pair_len;
+
+                    // Throughput report every 60s
+                    if now.duration_since(last_report) >= report_interval {
+                        let elapsed = now.duration_since(last_report).as_secs_f64();
+                        info!(
+                            "{network} throughput: {:.0} frames/s, {:.0} pairs/s (total {frame_count} frames, {pair_count} pairs in {elapsed:.0}s)",
+                            frame_count as f64 / elapsed,
+                            pair_count as f64 / elapsed,
+                        );
+                        frame_count = 0;
+                        pair_count = 0;
+                        last_report = now;
+                    }
+
                     // Send batch every interval
                     if now.duration_since(last_batch) >= batch_interval && !batch.is_empty() {
                         for frame in batch.drain(..) {
@@ -196,6 +245,10 @@ async fn run_chain_stream(stream: Arc<ChainStream>) {
         for frame in batch.drain(..) {
             let _ = stream.tx.send(frame);
         }
+
+        // Apply backoff before reconnecting
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(max_backoff);
     }
 }
 
