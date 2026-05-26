@@ -91,7 +91,7 @@ impl BebopClient {
 
         for chain in BEBOP_CHAINS {
             let ws_url = format!(
-                "{}://{}/{}/v3/pricing?authorization={}&format=protobuf&name=rave-relay&gasless=false&expiry_type=standard",
+                "{}://{}/{}/v3/pricing?authorization={}&format=protobuf&name=rave-trading&gasless=false&expiry_type=standard",
                 if base_url.starts_with("https") { "wss" } else { "ws" },
                 base_url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/'),
                 chain.network,
