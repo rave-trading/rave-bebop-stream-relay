@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package bebop;
+
+// PriceUpdate for a single trading pair.
+message PriceUpdate {
+  // 20-byte base token address
+  optional bytes base = 1;
+  // 20-byte quote token address
+  optional bytes quote = 2;
+  // Unix timestamp in seconds
+  optional uint64 last_update_ts = 3;
+  // Flat bid levels: [price, size, price, size, ...]
+  repeated float bids = 4 [packed=true];
+  // Flat ask levels: [price, size, price, size, ...]
+  repeated float asks = 5 [packed=true];
+}
+
+// Envelope: one or more pair updates per WS frame.
+message PricingUpdate {
+  repeated PriceUpdate pairs = 1;
+}
