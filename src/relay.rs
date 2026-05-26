@@ -21,6 +21,9 @@ enum ClientMessage {
         chain_ids: Option<Vec<u64>>,
         /// Specific bases to receive. Empty = all.
         bases: Option<Vec<String>>,
+        /// Engine-style symbols: "eip155:{chain_id}:{base}-{quote}".
+        /// Parsed into chain_ids + bases filter entries.
+        symbols: Option<Vec<String>>,
     },
     #[serde(rename = "unsubscribe")]
     Unsubscribe {
@@ -170,7 +173,7 @@ async fn handle_client(
             Ok(Message::Text(text)) => {
                 if let Ok(cmd) = serde_json::from_str::<ClientMessage>(&text) {
                     match cmd {
-                        ClientMessage::Subscribe { chain_ids, bases } => {
+                        ClientMessage::Subscribe { chain_ids, bases, symbols } => {
                             let mut filters = state.filters.write().await;
                             if let Some(f) = filters.get_mut(&client_id) {
                                 if let Some(ids) = chain_ids {
@@ -178,6 +181,16 @@ async fn handle_client(
                                 }
                                 if let Some(b) = bases {
                                     f.bases.extend(b);
+                                }
+                                // Parse engine-style eip155 symbols into
+                                // chain_ids and bases for filtering.
+                                if let Some(syms) = symbols {
+                                    for s in syms {
+                                        if let Some((cid, base)) = parse_eip155_symbol(&s) {
+                                            f.chain_ids.insert(cid);
+                                            f.bases.insert(base.to_lowercase());
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -212,4 +225,18 @@ async fn handle_client(
     state.unregister(client_id).await;
     info!("client {addr} disconnected (id={client_id})");
     Ok(())
+}
+
+/// Parse an engine-style symbol "eip155:{chain_id}:{base}-{quote}"
+/// into (chain_id, base_address). Returns None if the format doesn't match.
+fn parse_eip155_symbol(symbol: &str) -> Option<(u64, String)> {
+    let rest = symbol.strip_prefix("eip155:")?;
+    let (chain_str, pair) = rest.split_once(':')?;
+    let chain_id: u64 = chain_str.parse().ok()?;
+    let base = pair.split('-').next()?.to_string();
+    if base.len() >= 42 && base.starts_with("0x") {
+        Some((chain_id, base))
+    } else {
+        None
+    }
 }

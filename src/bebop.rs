@@ -1,8 +1,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::TimeZone;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
+use serde::ser::{Serialize, SerializeStruct, Serializer};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -10,27 +12,61 @@ use tracing::{error, info, warn};
 
 use crate::proto::{self, BebopChain, BEBOP_CHAINS};
 
-/// A decoded price frame ready for internal relay.
-#[derive(Debug, Clone, serde::Serialize)]
+/// Wire format: matches the engine's `DepthFrame::Snapshot` tagged-enum JSON.
+/// This allows the engine to consume relay frames with zero mapping via
+/// `JsonDepthWsClient`.
+#[derive(Debug, Clone)]
 pub struct RelayFrame {
+    pub provider_id: String,
     pub chain_id: u64,
     pub network: String,
     pub base: String,  // 0x-prefixed hex
     pub quote: String, // 0x-prefixed hex
     pub bids: Vec<Level>,
     pub asks: Vec<Level>,
-    pub timestamp: u64,
+    /// Unix timestamp in milliseconds.
+    pub timestamp_ms: u64,
+}
+
+impl Serialize for RelayFrame {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut st = s.serialize_struct("RelayFrame", 7)?;
+        st.serialize_field("type", "snapshot")?;
+        st.serialize_field("provider_id", &self.provider_id)?;
+        st.serialize_field(
+            "asset",
+            &format!("eip155:{}:{}-{}", self.chain_id, self.base, self.quote),
+        )?;
+        st.serialize_field("bids", &self.bids)?;
+        st.serialize_field("asks", &self.asks)?;
+        // Emit ISO 8601 for chrono::DateTime<Utc> deserialization.
+        let dt = chrono::Utc
+            .timestamp_millis_opt(self.timestamp_ms as i64)
+            .single()
+            .unwrap_or_else(chrono::Utc::now);
+        st.serialize_field("timestamp", &dt)?;
+        st.end()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Level {
+    /// Serialized as a decimal string so the engine's `rust_decimal::Decimal`
+    /// deserialization works without float→string round-trip issues.
+    #[serde(serialize_with = "serialize_f32_as_string")]
     pub price: f32,
+    #[serde(serialize_with = "serialize_f32_as_string")]
     pub size: f32,
+}
+
+fn serialize_f32_as_string<S: Serializer>(value: &f32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&value.to_string())
 }
 
 /// Connected Bebop stream for a single chain.
 struct ChainStream {
     chain: &'static BebopChain,
+    provider_id: String,
     tx: broadcast::Sender<RelayFrame>,
     #[allow(dead_code)]
     url: String,
@@ -47,6 +83,7 @@ impl BebopClient {
     pub async fn connect_all(
         base_url: &str,
         authorization: &str,
+        provider_id: &str,
         tx: broadcast::Sender<RelayFrame>,
     ) -> Result<Self, String> {
         let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>(1);
@@ -63,6 +100,7 @@ impl BebopClient {
 
             let stream = Arc::new(ChainStream {
                 chain,
+                provider_id: provider_id.to_string(),
                 tx: tx.clone(),
                 url: ws_url.clone(),
             });
@@ -86,6 +124,7 @@ impl BebopClient {
 async fn run_chain_stream(stream: Arc<ChainStream>) {
     let chain_id = stream.chain.chain_id;
     let network = stream.chain.network;
+    let provider_id = stream.provider_id.clone();
     let url = &stream.url;
 
     loop {
@@ -134,7 +173,7 @@ async fn run_chain_stream(stream: Arc<ChainStream>) {
                 Ok(update) => {
                     let now = Instant::now();
                     for pair in update.pairs {
-                        let frame = decode_pair(chain_id, network, &pair);
+                        let frame = decode_pair(chain_id, network, &provider_id, &pair);
                         batch.push(frame);
                     }
                     // Send batch every interval
@@ -158,19 +197,20 @@ async fn run_chain_stream(stream: Arc<ChainStream>) {
     }
 }
 
-fn decode_pair(chain_id: u64, network: &str, pair: &proto::PriceUpdate) -> RelayFrame {
+fn decode_pair(chain_id: u64, network: &str, provider_id: &str, pair: &proto::PriceUpdate) -> RelayFrame {
     let base = pair.base.as_deref().map(bytes_to_hex).unwrap_or_default();
     let quote = pair.quote.as_deref().map(bytes_to_hex).unwrap_or_default();
     let bids = levels_from_flat(&pair.bids);
     let asks = levels_from_flat(&pair.asks);
     RelayFrame {
+        provider_id: provider_id.to_string(),
         chain_id,
         network: network.to_string(),
         base,
         quote,
         bids,
         asks,
-        timestamp: pair.last_update_ts.unwrap_or(0),
+        timestamp_ms: pair.last_update_ts.unwrap_or(0),
     }
 }
 
