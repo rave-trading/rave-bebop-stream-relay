@@ -84,6 +84,7 @@ impl BebopClient {
         base_url: &str,
         authorization: &str,
         provider_id: &str,
+        stream_name: &str,
         tx: broadcast::Sender<RelayFrame>,
     ) -> Result<Self, String> {
         let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>(1);
@@ -91,11 +92,12 @@ impl BebopClient {
 
         for chain in BEBOP_CHAINS {
             let ws_url = format!(
-                "{}://{}/{}/v3/pricing?authorization={}&format=protobuf&name=rave-trading&gasless=false&expiry_type=standard",
+                "{}://{}/{}/v3/pricing?authorization={}&format=protobuf&name={}&gasless=false&expiry_type=standard",
                 if base_url.starts_with("https") { "wss" } else { "ws" },
                 base_url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/'),
                 chain.network,
-                authorization
+                authorization,
+                stream_name,
             );
 
             let stream = Arc::new(ChainStream {
