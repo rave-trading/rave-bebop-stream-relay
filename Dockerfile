@@ -12,12 +12,6 @@ COPY Cargo.toml Cargo.lock* build.rs ./
 COPY proto/ proto/
 COPY src/ src/
 
-# Warm build cache with dependencies (dummy main, then real build)
-RUN mkdir -p src && echo 'fn main(){}' > src/main.rs
-RUN cargo build --release 2>/dev/null || true
-RUN rm -rf src
-
-COPY src/ src/
 RUN cargo build --release
 
 # ── Runner ───────────────────────────────────────────────────────────
