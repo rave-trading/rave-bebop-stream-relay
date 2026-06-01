@@ -6,6 +6,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
@@ -60,14 +63,18 @@ pub struct RelayState {
     /// Per-client filters (keyed by an opaque client id for this session).
     filters: RwLock<HashMap<usize, ClientFilter>>,
     next_id: Mutex<usize>,
+    /// Optional bearer token required on public/raw WebSocket connections.
+    /// When unset, legacy private Railway consumers can connect without auth.
+    auth_token: Option<String>,
 }
 
 impl RelayState {
-    pub fn new(source_rx: broadcast::Receiver<RelayFrame>) -> Self {
+    pub fn new(source_rx: broadcast::Receiver<RelayFrame>, auth_token: Option<String>) -> Self {
         Self {
             source_rx: Mutex::new(source_rx),
             filters: RwLock::new(HashMap::new()),
             next_id: Mutex::new(0),
+            auth_token,
         }
     }
 
@@ -116,8 +123,17 @@ async fn handle_client(
     addr: SocketAddr,
     state: Arc<RelayState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ws = tokio_tungstenite::accept_async(stream).await?;
-    let (mut ws_tx, mut ws_rx) = ws.split();
+    let auth_token = state.auth_token.clone();
+    let ws = accept_hdr_async(stream, move |req: &Request, response: Response| {
+        if let Some(expected) = auth_token.as_deref() {
+            if !authorization_matches(req, expected) {
+                return Err(unauthorized_response());
+            }
+        }
+        Ok(response)
+    })
+    .await?;
+    let (ws_tx, mut ws_rx) = ws.split();
 
     // Default filter: receive everything.
     let filter = ClientFilter {
@@ -130,7 +146,7 @@ async fn handle_client(
     // Spawn a task that reads from the Bebop broadcast and forwards to this
     // client. The relay source is shared; each client gets its own rx stream.
     let mut source_rx = {
-        let mut guard = state.source_rx.lock().await;
+        let guard = state.source_rx.lock().await;
         guard.resubscribe()
     };
     let state_clone = state.clone();
@@ -173,7 +189,11 @@ async fn handle_client(
             Ok(Message::Text(text)) => {
                 if let Ok(cmd) = serde_json::from_str::<ClientMessage>(&text) {
                     match cmd {
-                        ClientMessage::Subscribe { chain_ids, bases, symbols } => {
+                        ClientMessage::Subscribe {
+                            chain_ids,
+                            bases,
+                            symbols,
+                        } => {
                             let mut filters = state.filters.write().await;
                             if let Some(f) = filters.get_mut(&client_id) {
                                 if let Some(ids) = chain_ids {
@@ -211,7 +231,9 @@ async fn handle_client(
                         }
                         ClientMessage::Ping => {
                             let mut guard = ws_tx.lock().await;
-                            let _ = guard.send(Message::Text("{\"type\":\"pong\"}".into())).await;
+                            let _ = guard
+                                .send(Message::Text("{\"type\":\"pong\"}".into()))
+                                .await;
                         }
                     }
                 }
@@ -227,6 +249,31 @@ async fn handle_client(
     Ok(())
 }
 
+fn authorization_matches(req: &Request, expected_token: &str) -> bool {
+    let expected = bearer_header_value(expected_token);
+    req.headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim() == expected)
+        .unwrap_or(false)
+}
+
+fn bearer_header_value(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.contains(' ') {
+        trimmed.to_string()
+    } else {
+        format!("Bearer {trimmed}")
+    }
+}
+
+fn unauthorized_response() -> ErrorResponse {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .body(Some("unauthorized".to_string()))
+        .expect("valid unauthorized websocket response")
+}
+
 /// Parse an engine-style symbol "eip155:{chain_id}:{base}-{quote}"
 /// into (chain_id, base_address). Returns None if the format doesn't match.
 fn parse_eip155_symbol(symbol: &str) -> Option<(u64, String)> {
@@ -238,5 +285,51 @@ fn parse_eip155_symbol(symbol: &str) -> Option<(u64, String)> {
         Some((chain_id, base))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with_auth(value: Option<&str>) -> Request {
+        let mut builder = Request::builder().uri("ws://localhost:8080/");
+        if let Some(value) = value {
+            builder = builder.header("authorization", value);
+        }
+        builder.body(()).unwrap()
+    }
+
+    #[test]
+    fn authorization_matches_bearer_token_and_header_values() {
+        assert!(authorization_matches(
+            &request_with_auth(Some("Bearer raw-relay-token")),
+            "raw-relay-token"
+        ));
+        assert!(authorization_matches(
+            &request_with_auth(Some("Bearer raw-relay-token")),
+            "Bearer raw-relay-token"
+        ));
+        assert!(!authorization_matches(
+            &request_with_auth(Some("Bearer other")),
+            "raw-relay-token"
+        ));
+        assert!(!authorization_matches(
+            &request_with_auth(None),
+            "raw-relay-token"
+        ));
+    }
+
+    #[test]
+    fn parse_eip155_symbol_extracts_chain_and_base() {
+        assert_eq!(
+            parse_eip155_symbol(
+                "eip155:1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48-0xdac17f958d2ee523a2206206994597c13d831ec7"
+            ),
+            Some((
+                1,
+                "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".to_string()
+            ))
+        );
     }
 }
