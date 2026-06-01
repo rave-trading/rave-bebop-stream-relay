@@ -12,8 +12,7 @@ use tracing::info;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -21,10 +20,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "https://api.bebop.xyz/pmm".to_string());
     let authorization = std::env::var("BEBOP_PRICE_STREAM_AUTH")
         .map_err(|_| "BEBOP_PRICE_STREAM_AUTH environment variable is required")?;
-    let provider_id = std::env::var("PROVIDER_ID")
-        .unwrap_or_else(|_| "bebop-price-stream".to_string());
-    let stream_name = std::env::var("BEBOP_STREAM_NAME")
-        .unwrap_or_else(|_| "rave-trading".to_string());
+    let provider_id =
+        std::env::var("PROVIDER_ID").unwrap_or_else(|_| "bebop-price-stream".to_string());
+    let relay_auth_token = std::env::var("RELAY_AUTH_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let stream_name =
+        std::env::var("BEBOP_STREAM_NAME").unwrap_or_else(|_| "rave-trading".to_string());
     let bind_addr: SocketAddr = std::env::var("BIND_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
         .parse()
@@ -47,10 +50,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("connecting to Bebop pricing streams (5 chains)...");
-    let _bebop = bebop::BebopClient::connect_all(&base_url, &authorization, &provider_id, &stream_name, bebop_tx.clone()).await?;
+    let _bebop = bebop::BebopClient::connect_all(
+        &base_url,
+        &authorization,
+        &provider_id,
+        &stream_name,
+        bebop_tx.clone(),
+    )
+    .await?;
 
     info!("starting internal relay WS on {bind_addr}");
-    let state = Arc::new(relay::RelayState::new(bebop_rx));
+    let state = Arc::new(relay::RelayState::new(bebop_rx, relay_auth_token));
     relay::serve(bind_addr, state).await?;
 
     Ok(())

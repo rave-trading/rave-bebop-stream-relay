@@ -113,7 +113,10 @@ impl BebopClient {
             });
 
             streams.push(stream);
-            info!("spawned Bebop stream for {} (chain {})", chain.name, chain.chain_id);
+            info!(
+                "spawned Bebop stream for {} (chain {})",
+                chain.name, chain.chain_id
+            );
         }
 
         Ok(Self {
@@ -231,7 +234,12 @@ async fn run_chain_stream(stream: Arc<ChainStream>) {
     }
 }
 
-fn decode_pair(chain_id: u64, network: &str, provider_id: &str, pair: &proto::PriceUpdate) -> RelayFrame {
+fn decode_pair(
+    chain_id: u64,
+    network: &str,
+    provider_id: &str,
+    pair: &proto::PriceUpdate,
+) -> RelayFrame {
     let base = pair.base.as_deref().map(bytes_to_hex).unwrap_or_default();
     let quote = pair.quote.as_deref().map(bytes_to_hex).unwrap_or_default();
     let bids = levels_from_flat(&pair.bids);
@@ -281,10 +289,7 @@ mod tests {
 
     #[test]
     fn test_bytes_to_hex() {
-        assert_eq!(
-            bytes_to_hex(&[0xaa, 0xbb, 0xcc]),
-            "0xaabbcc"
-        );
+        assert_eq!(bytes_to_hex(&[0xaa, 0xbb, 0xcc]), "0xaabbcc");
     }
 
     #[test]
